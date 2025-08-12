@@ -1,3 +1,5 @@
+# main.py
+# -*- coding: utf-8 -*-
 import os
 import re
 import time
@@ -6,11 +8,15 @@ from logging.handlers import RotatingFileHandler
 import threading
 from dataclasses import dataclass
 from typing import List
-from dotenv import load_dotenv
-load_dotenv()  # подцепим .env перед чтением os.getenv(...)
 import subprocess
+import shutil
+from pathlib import Path
 
-# ——— Тишина в консоли, всё в bot.log ———
+# ── .env загружаем из той же папки, где лежит main.py ──
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
+
+# ── Тишина в консоли: весь мусор в лог ──
 try:
     import sys
     sys.stdout = open(os.devnull, "w", buffering=1)
@@ -36,7 +42,7 @@ from telegram.ext import (
     CallbackQueryHandler, ConversationHandler
 )
 
-# ——— Настройки ———
+# ── Настройки ──
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 LOGIN_URL = "https://mlkm.netbynet.ru/loginTemp"
 
@@ -48,7 +54,7 @@ LOG_FILE = os.getenv("LOG_FILE", "bot.log")
 LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024)))
 LOG_BACKUPS = int(os.getenv("LOG_BACKUPS", "2"))
 
-# ——— Логирование ———
+# ── Логирование ──
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -59,10 +65,10 @@ log = logging.getLogger("mlkm-bot")
 for noisy in ["apscheduler", "urllib3", "WDM", "selenium", "telegram"]:
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-# ——— Диалоговые состояния ———
+# ── Диалоговые состояния ──
 OPERATOR, LOGIN, PASS = range(3)
 
-# ——— Модели ———
+# ── Модели ──
 @dataclass
 class ServiceRow:
     product: str
@@ -96,7 +102,29 @@ class Collected:
     client: ClientData
     pppoe: PppoeData
 
-# ——— Selenium helpers ———
+# ── Selenium helpers ──
+def _find_chrome_binary() -> str:
+    """Ищем установленный Chrome/Chromium (Ubuntu, snap и т.п.). Можно задать CHROME_BIN в .env."""
+    env_bin = os.getenv("CHROME_BIN")
+    if env_bin and os.path.exists(env_bin):
+        return env_bin
+    candidates = [
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+        "/opt/google/chrome/chrome",
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return ""
+
 def build_driver(headless: bool = True) -> webdriver.Chrome:
     chrome_options = Options()
     if headless:
@@ -110,10 +138,18 @@ def build_driver(headless: bool = True) -> webdriver.Chrome:
     chrome_options.add_argument("--disable-logging")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     chrome_options.add_experimental_option("useAutomationExtension", False)
+
+    bin_path = _find_chrome_binary()
+    if bin_path:
+        chrome_options.binary_location = bin_path
+    else:
+        log.warning("Chrome/Chromium не найден. Установите браузер (google-chrome-stable или chromium).")
+
     try:
         service = Service(ChromeDriverManager().install(), log_output=subprocess.DEVNULL)
     except TypeError:
         service = Service(ChromeDriverManager().install())
+
     driver = webdriver.Chrome(service=service, options=chrome_options)
     driver.set_page_load_timeout(60)
     return driver
@@ -173,7 +209,7 @@ def click_tab(driver, title):
     time.sleep(1.0)
     _wait(driver).until(lambda d: get_active_tab_panel(d))
 
-# ——— Главная: читаем из той же строки таблицы ———
+# ── Главная: берём значение из той же строки таблицы ──
 def _main_field(driver, label: str) -> str:
     xp1 = f"//tr[./td[normalize-space()='{label}']]/td[2]"
     xp2 = f"//td[normalize-space()='{label}']/following-sibling::td[1]"
@@ -211,7 +247,7 @@ def _main_field(driver, label: str) -> str:
         pass
     return "—"
 
-# ——— Вспомогательные для вкладок ———
+# ── Вспомогательные для вкладок ──
 def _closest_group(node):
     for xp in ["ancestor::tr[1]",
                "ancestor::*[contains(@class,'form-group')][1]",
@@ -249,10 +285,10 @@ def _value_from_same_row(group, label_node):
 def _value_in_panel(panel, label: str) -> str:
     """
     Устойчиво вытаскивает значение по лейблу внутри активной вкладки:
-    - label starts-with (учёт ё/е), допускаем двоеточие
-    - сначала label[for] → control
-    - затем input/select/textarea в том же form-group/row
-    - иначе значение из соседнего td той же строки
+    - label starts-with (учёт ё/е)
+    - label[for] → control
+    - input/select/textarea в том же блоке
+    - значение из соседнего td (табличный случай)
     - план Б: bs4 в пределах группы
     """
     if panel is None:
@@ -267,7 +303,7 @@ def _value_in_panel(panel, label: str) -> str:
     except Exception:
         return "—"
 
-    # label[for] → целевой control
+    # 1) label[for]
     try:
         for_attr = lbl.get_attribute("for")
         if for_attr:
@@ -283,7 +319,7 @@ def _value_in_panel(panel, label: str) -> str:
 
     group = _closest_group(lbl) or panel
 
-    # input/select/textarea внутри того же блока (приоритетно ближайшие после лейбла)
+    # 2) input/select/textarea рядом
     for xp in [
         ".//following-sibling::*[self::input or self::textarea or self::select][1]",
         ".//following::*[self::input or self::textarea or self::select][1]",
@@ -300,12 +336,12 @@ def _value_in_panel(panel, label: str) -> str:
         except Exception:
             pass
 
-    # Табличная строка
+    # 3) Табличная строка
     val = _value_from_same_row(group, lbl)
     if val != "—":
         return val
 
-    # bs4 в пределах группы
+    # 4) bs4
     try:
         html = (group if group != panel else panel).get_attribute("innerHTML") or ""
         soup = BeautifulSoup(html, "html.parser")
@@ -323,7 +359,7 @@ def _value_in_panel(panel, label: str) -> str:
         pass
     return "—"
 
-# ——— Услуги ———
+# ── Услуги ──
 def table_services(driver) -> List[ServiceRow]:
     out: List[ServiceRow] = []
     try:
@@ -346,7 +382,7 @@ def table_services(driver) -> List[ServiceRow]:
         log.warning("Не удалось распарсить таблицу услуг: %s", e)
     return out
 
-# ——— PPPoE ———
+# ── PPPoE ──
 def _pppoe_read(panel) -> PppoeData:
     p = PppoeData()
     try:
@@ -368,7 +404,7 @@ def _pppoe_read(panel) -> PppoeData:
         pass
     return p
 
-# ——— Основной сбор ———
+# ── Основной сбор ──
 def collect_megafon(login: str, password: str) -> Collected:
     driver = build_driver(HEADLESS)
     try:
@@ -393,10 +429,13 @@ def collect_megafon(login: str, password: str) -> Collected:
         main.address = _main_field(driver, "Адрес подключения")
         main.temp_password = _main_field(driver, "Временный пароль")
         # маски
-        m = re.search(r"\b(?:Req\d{6,}|\d{6,})\b", main.request_number or "");  main.request_number = m.group(0) if m else main.request_number
-        m = re.search(r"\b\d{4,}\b", main.account_number or "");               main.account_number = m.group(0) if m else main.account_number
+        m = re.search(r"\b(?:Req\d{6,}|\d{6,})\b", main.request_number or "")
+        if m: main.request_number = m.group(0)
+        m = re.search(r"\b\d{4,}\b", main.account_number or "")
+        if m: main.account_number = m.group(0)
         if main.temp_password and main.temp_password != "—":
-            m = re.search(r"[A-Za-z0-9]{4,64}", main.temp_password);          main.temp_password = m.group(0) if m else main.temp_password
+            m = re.search(r"[A-Za-z0-9]{4,64}", main.temp_password)
+            if m: main.temp_password = m.group(0)
 
         main.services = table_services(driver)
 
@@ -427,7 +466,7 @@ def collect_megafon(login: str, password: str) -> Collected:
         except Exception:
             pass
 
-# ——— Форматирование ———
+# ── Форматирование ──
 def format_collected(data: Collected) -> str:
     services_lines = []
     if data.main.services:
@@ -455,7 +494,7 @@ def format_collected(data: Collected) -> str:
     )
     return text
 
-# ——— Telegram ———
+# ── Telegram ──
 def start(update: Update, context: CallbackContext) -> int:
     user = update.effective_user
     name = user.first_name or user.username or "друг"
@@ -475,7 +514,7 @@ def help_cmd(update: Update, context: CallbackContext):
         "Подсказки:\n"
         "1️⃣ Нажмите на нужного оператора.\n"
         "2️⃣ Введите логин и пароль, когда бот попросит.\n"
-        "3️⃣ Подождите некоторое время — бот соберёт данные и выведет вам.\n"
+        "3️⃣ Подождите ~10–15 секунд — бот соберёт данные и пришлёт ответ.\n"
         "Команды: /start — начать заново, /cancel — отмена."
     )
 
@@ -512,8 +551,7 @@ def scrape_worker(chat_id: int, login: str, pwd: str, context: CallbackContext):
         log.exception("Ошибка при сборе данных: %s", e)
         context.bot.send_message(
             chat_id,
-            "Не удалось собрать данные. Возможные причины: сайт недоступен, "
-            "или неверные логин/пароль. Попробуйте ещё раз (/start)."
+            "Не удалось собрать данные. Возможные причины: сайт недоступен или неверные логин/пароль. Попробуйте ещё раз (/start)."
         )
 
 def get_pass_and_run(update: Update, context: CallbackContext) -> int:
@@ -527,9 +565,10 @@ def get_pass_and_run(update: Update, context: CallbackContext) -> int:
     return ConversationHandler.END
 
 def main():
-    if not BOT_TOKEN or BOT_TOKEN.startswith("PUT_"):
-        log.error("Установите переменную окружения BOT_TOKEN с токеном бота.")
+    if not BOT_TOKEN:
+        log.error("BOT_TOKEN не найден. Проверьте файл .env рядом с main.py")
         raise SystemExit(1)
+
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
@@ -547,14 +586,14 @@ def main():
     dp.add_handler(CommandHandler("help", help_cmd))
     dp.add_handler(CommandHandler("cancel", cancel))
 
-    log.info("Бот запущен.")
-    # Меню команд для кнопки "Menu" в Telegram
+    # Меню команд для кнопки "Menu"
     updater.bot.set_my_commands([
         BotCommand("start", "Начать заново / выбор оператора"),
-        BotCommand("help", "Подсказки по работе с ботом"),
-        BotCommand("cancel", "Отменить текущий шаг"),
+        BotCommand("help",  "Подсказки по работе с ботом"),
+        BotCommand("cancel","Отменить текущий шаг"),
     ])
 
+    log.info("Бот запущен.")
     updater.start_polling()
     updater.idle()
 
